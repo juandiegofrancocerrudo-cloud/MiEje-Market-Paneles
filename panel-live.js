@@ -26,6 +26,11 @@
       const { data: auth, error: authError } = await db.auth.getUser();
       if (authError || !auth.user) { window.location.replace('login.html'); return; }
       currentUser = auth.user;
+      const passwordStatus = await callTechnicalFunction({ action: 'password_change_status' });
+      if (passwordStatus.must_change_password) {
+        await requireInitialPasswordChange();
+        return;
+      }
       const { data: profile, error: profileError } = await db.from('profiles').select('id,display_name,platform_role').eq('id', currentUser.id).single();
       if (profileError || !profile) throw new Error('No se pudo verificar el perfil. Cierra sesión y vuelve a ingresar.');
       currentProfile = profile;
@@ -235,7 +240,7 @@
     try {
       const result = await callTechnicalFunction(payload);
       message.className = 'message success';
-      message.textContent = `Negocio creado: ${result.business.name}. Identificador público: ${result.business.slug}. Ahora puedes invitar a su administrador y empleados.`;
+      message.textContent = `Negocio creado: ${result.business.name}. Identificador público: ${result.business.slug}. Ahora puedes crear directamente las cuentas de su administrador y empleados.`;
       form.reset();
       form.elements.city.value = 'Pereira, Risaralda';
       await loadTechnical();
@@ -253,29 +258,87 @@
     } finally { button.disabled = false; }
   }
 
+  function generateTemporaryPassword() {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%*-_';
+    const bytes = new Uint8Array(24);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, byte => alphabet[byte % alphabet.length]).join('');
+  }
+
   async function inviteBusinessMember(event) {
     event.preventDefault();
     const form = event.currentTarget;
     const button = form.querySelector('button[type="submit"]');
     const message = document.querySelector('#inviteMemberMessage');
     const payload = Object.fromEntries(new FormData(form).entries());
-    payload.action = 'invite_member';
+    const temporaryPassword = generateTemporaryPassword();
+    payload.action = 'create_member';
+    payload.password = temporaryPassword;
     payload.is_business_owner = form.elements.is_business_owner?.checked === true;
-    payload.redirect_to = new URL('aceptar-invitacion.html', window.location.href).href;
     button.disabled = true;
     message.className = 'message';
-    message.textContent = 'Creando invitación y registrando la asignación…';
+    message.textContent = 'Creando cuenta, asignando permisos y registrando la auditoría…';
     try {
       const result = await callTechnicalFunction(payload);
       message.className = 'message success';
-      message.textContent = `Invitación preparada para ${result.email} como ${result.role === 'business_admin' ? 'administrador' : 'empleado'} de ${result.business}. La persona debe abrir el correo y configurar su contraseña.`;
+      if (result.created) {
+        message.textContent = `Cuenta creada para ${result.email} como ${result.role === 'business_admin' ? 'administrador' : 'empleado'} de ${result.business}. CONTRASEÑA INICIAL (cópiala ahora y entrégala de forma privada): ${temporaryPassword}. No se envió ningún correo. La persona deberá cambiar esta contraseña al entrar por primera vez.`;
+      } else {
+        message.textContent = `El correo ${result.email} ya tenía una cuenta. Se asignó al negocio ${result.business} con el rol ${result.role === 'business_admin' ? 'administrador' : 'empleado'}. No se cambió su contraseña: debe utilizar la que ya tenía.`;
+      }
       const keepBusiness = form.elements.business_id.value;
       form.reset();
       form.elements.business_id.value = keepBusiness;
     } catch (error) {
       message.className = 'message error';
-      message.textContent = error.message || 'No se pudo enviar la invitación.';
+      message.textContent = error.message || 'No se pudo crear la cuenta. Si la conexión se interrumpió, verifica primero si la cuenta quedó creada antes de volver a intentarlo.';
     } finally { button.disabled = false; }
+  }
+
+  async function requireInitialPasswordChange() {
+    document.querySelectorAll('.panel-section, #statsGrid').forEach(el => { if (el) el.classList.add('hidden'); });
+    const overlay = document.createElement('div');
+    overlay.id = 'initialPasswordOverlay';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:#f3f6fb;display:grid;place-items:center;padding:20px;';
+    overlay.innerHTML = `
+      <form id="initialPasswordForm" style="width:min(100%,460px);background:#fff;padding:28px;border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,.12);font-family:system-ui,sans-serif;color:#172033;">
+        <h1 style="margin:0 0 8px;font-size:24px;">Cambia tu contraseña inicial</h1>
+        <p style="margin:0 0 20px;line-height:1.5;color:#536174;">Por seguridad, debes crear una contraseña personal antes de entrar a MiEje Market. Usa al menos 12 caracteres y no la compartas.</p>
+        <label for="newPassword" style="display:block;margin:12px 0 6px;font-weight:600;">Nueva contraseña</label>
+        <input id="newPassword" type="password" minlength="12" autocomplete="new-password" required style="box-sizing:border-box;width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:8px;">
+        <label for="confirmPassword" style="display:block;margin:12px 0 6px;font-weight:600;">Confirmar contraseña</label>
+        <input id="confirmPassword" type="password" minlength="12" autocomplete="new-password" required style="box-sizing:border-box;width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:8px;">
+        <p id="passwordChangeMessage" role="status" style="min-height:22px;color:#b42318;font-size:14px;"></p>
+        <button type="submit" style="width:100%;padding:12px;border:0;border-radius:8px;background:#173b70;color:#fff;font-weight:700;cursor:pointer;">Guardar nueva contraseña</button>
+        <button type="button" id="passwordChangeLogout" style="width:100%;padding:10px;margin-top:8px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;cursor:pointer;">Cerrar sesión</button>
+      </form>`;
+    document.body.appendChild(overlay);
+    const form = overlay.querySelector('#initialPasswordForm');
+    const message = overlay.querySelector('#passwordChangeMessage');
+    overlay.querySelector('#passwordChangeLogout').addEventListener('click', signOut);
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = form.querySelector('button[type="submit"]');
+      const password = overlay.querySelector('#newPassword').value;
+      const confirmation = overlay.querySelector('#confirmPassword').value;
+      if (password.length < 12) { message.textContent = 'La contraseña debe tener al menos 12 caracteres.'; return; }
+      if (password !== confirmation) { message.textContent = 'Las contraseñas no coinciden.'; return; }
+      button.disabled = true;
+      message.style.color = '#536174';
+      message.textContent = 'Actualizando contraseña…';
+      try {
+        const { error } = await db.auth.updateUser({ password });
+        if (error) throw error;
+        await callTechnicalFunction({ action: 'complete_password_change' });
+        message.style.color = '#067647';
+        message.textContent = 'Contraseña actualizada. Abriendo tu panel…';
+        window.location.reload();
+      } catch (error) {
+        message.style.color = '#b42318';
+        message.textContent = error.message || 'No se pudo cambiar la contraseña. Inténtalo de nuevo.';
+        button.disabled = false;
+      }
+    });
   }
 
   async function changeBusinessStatus(id, isActive, button) {
